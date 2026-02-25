@@ -1,0 +1,4 @@
+{
+  "buildCommand": "CI= npm run build",
+  "outputDirectory": "build"
+}
