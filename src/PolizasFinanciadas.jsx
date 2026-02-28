@@ -10,25 +10,23 @@ import {
   onSnapshot,
   query,
   where,
-  collectionGroup,
-  getDocs,
 } from "firebase/firestore";
 
 import { onAuthStateChanged } from "firebase/auth";
 
 function getSemaforo(poliza) {
-  if (poliza.endoso === "") return "rojo";
+  if ((poliza.endoso || "") === "") return "rojo";
 
   const baseCompleta =
-    poliza.montada && poliza.recaudada && poliza.firmada && poliza.desembolsada;
+    !!poliza.montada && !!poliza.recaudada && !!poliza.firmada && !!poliza.desembolsada;
 
   const baseParcial =
-    poliza.montada || poliza.recaudada || poliza.firmada || poliza.desembolsada;
+    !!poliza.montada || !!poliza.recaudada || !!poliza.firmada || !!poliza.desembolsada;
 
   // 🟡 Delegada
-  if (poliza.delegada) {
-    if (poliza.endoso === "SI") {
-      if (baseCompleta && poliza.certificacion && poliza.correoEndoso) return "verde";
+  if (!!poliza.delegada) {
+    if ((poliza.endoso || "") === "SI") {
+      if (baseCompleta && !!poliza.certificacion && !!poliza.correoEndoso) return "verde";
     } else {
       if (baseCompleta) return "verde";
     }
@@ -36,9 +34,9 @@ function getSemaforo(poliza) {
   }
 
   // 🟣 ENDOSO SI
-  if (poliza.endoso === "SI") {
-    if (baseCompleta && poliza.certificacion && poliza.correoEndoso) return "verde";
-    if (baseParcial || poliza.certificacion) return "amarillo";
+  if ((poliza.endoso || "") === "SI") {
+    if (baseCompleta && !!poliza.certificacion && !!poliza.correoEndoso) return "verde";
+    if (baseParcial || !!poliza.certificacion) return "amarillo";
     return "rojo";
   }
 
@@ -87,7 +85,10 @@ export default function PolizasFinanciadas() {
   // filtros
   const [filtroSemaforo, setFiltroSemaforo] = useState("todas"); // todas | rojo | amarillo | verde
 
-  // ✅ Sesión (solo para permitir crear/editar si tus reglas lo exigen)
+  // ✅ BUSCADOR
+  const [busqueda, setBusqueda] = useState("");
+
+  // ✅ Sesión
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       setUid(user ? user.uid : null);
@@ -97,30 +98,17 @@ export default function PolizasFinanciadas() {
     return () => unsub();
   }, []);
 
-
-
-
-  
-  // ✅ Carga realtime DIRECTO EN RAÍZ: /polizasFinanciadas
+  // ✅ Carga realtime desde SUBCOLECCIÓN por UID: cartera/{uid}/polizasFinanciadas
   useEffect(() => {
-    // Si quieres permitir ver sin sesión, quita este if.
     if (!uid) {
       setPolizas([]);
       return;
     }
 
-
-
-    
-    if (!uid) {
-  setPolizas([]);
-  return;
-}
-
-const ref = query(
-  collection(db, "cartera", uid, "polizasFinanciadas"),
-  where("tipo", "==", "financiada")
-);
+    const ref = query(
+      collection(db, "cartera", uid, "polizasFinanciadas"),
+      where("tipo", "==", "financiada")
+    );
 
     const unsubscribe = onSnapshot(
       ref,
@@ -129,7 +117,7 @@ const ref = query(
         setPolizas(datos);
       },
       (err) => {
-        console.error("❌ onSnapshot financiadas (raíz):", err);
+        console.error("❌ onSnapshot financiadas (subcolección UID):", err);
         alert("No se pudo leer pólizas financiadas. Revisa reglas/permisos.");
       }
     );
@@ -156,78 +144,83 @@ const ref = query(
     desembolsada: false,
     delegada: false,
     delegadaA: "",
-    // ✅ NUEVO
     gestionTexto: "",
     tipo: "financiada",
     createdAt: Date.now(),
   });
 
-const agregarPoliza = async () => {
-  if (!uid) return;
+  const agregarPoliza = async () => {
+    if (!uid) return;
 
-  try {
-    await addDoc(
-      collection(db, "cartera", uid, "polizasFinanciadas"),
-      plantillaNueva()
-    );
-  } catch (error) {
-    console.error("❌ Error creando póliza financiada:", error);
-    alert("Error creando póliza. Revisa consola y permisos/reglas.");
-  }
-};
+    try {
+      await addDoc(collection(db, "cartera", uid, "polizasFinanciadas"), plantillaNueva());
+    } catch (error) {
+      console.error("❌ Error creando póliza financiada:", error);
+      alert("Error creando póliza. Revisa consola y permisos/reglas.");
+    }
+  };
 
-const guardarCampo = async (id, patch) => {
-  if (!uid) return;
+  const guardarCampo = async (id, patch) => {
+    if (!uid) return;
+    try {
+      await updateDoc(doc(db, "cartera", uid, "polizasFinanciadas", id), patch);
+    } catch (error) {
+      console.error("❌ Error guardando cambio:", error);
+      alert("No se pudo guardar. Revisa permisos/reglas o conexión.");
+    }
+  };
 
-  try {
-    await updateDoc(
-      doc(db, "cartera", uid, "polizasFinanciadas", id),
-      patch
-    );
-  } catch (error) {
-    console.error("❌ Error guardando cambio:", error);
-    alert("No se pudo guardar. Revisa permisos/reglas o conexión.");
-  }
-};
-
-const eliminarPoliza = async (id) => {
-  const ok = window.confirm("¿Seguro que quieres eliminar esta póliza financiada?");
-  if (!ok || !uid) return;
-
-  try {
-    await deleteDoc(
-      doc(db, "cartera", uid, "polizasFinanciadas", id)
-    );
-  } catch (error) {
-    console.error("❌ Error eliminando póliza:", error);
-    alert("No se pudo eliminar. Revisa permisos/reglas o conexión.");
-  }
-};
-
-  const borrarTodo = async () => {
-    const ok = window.confirm("⚠️ Esto eliminará TODAS las pólizas financiadas visibles. ¿Continuar?");
+  const eliminarPoliza = async (id) => {
+    const ok = window.confirm("¿Seguro que quieres eliminar esta póliza financiada?");
     if (!ok || !uid) return;
 
     try {
-      for (const p of dataRender) {
-        await deleteDoc(doc(db, "polizasFinanciadas", p.id));
-      }
+      await deleteDoc(doc(db, "cartera", uid, "polizasFinanciadas", id));
     } catch (error) {
-      console.error("❌ Error borrando todo:", error);
-      alert("No se pudo borrar todo. Revisa permisos/reglas o conexión.");
+      console.error("❌ Error eliminando póliza:", error);
+      alert("No se pudo eliminar. Revisa permisos/reglas o conexión.");
     }
   };
 
   const sinSesion = authReady && !uid;
 
   // =========================
-  // FILTRO + CONTADORES
+  // FILTRO + BUSCADOR
   // =========================
   const dataRender = useMemo(() => {
-    if (filtroSemaforo === "todas") return polizas;
-    return polizas.filter((p) => getSemaforo(p) === filtroSemaforo);
-  }, [polizas, filtroSemaforo]);
+    const q = (busqueda || "").trim().toLowerCase();
 
+    let base = polizas;
+
+    // 1) filtro por semáforo
+    if (filtroSemaforo !== "todas") {
+      base = base.filter((p) => getSemaforo(p) === filtroSemaforo);
+    }
+
+    // 2) filtro por búsqueda
+    if (!q) return base;
+
+    return base.filter((p) => {
+      const texto = [
+        p.numeroPoliza,
+        p.placa,
+        p.nombre,
+        p.entidad,
+        p.aseguradora,
+        p.gestor,
+        p.gestionTexto,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return texto.includes(q);
+    });
+  }, [polizas, filtroSemaforo, busqueda]);
+
+  // =========================
+  // CONTADORES
+  // =========================
   const contadores = useMemo(() => {
     const total = polizas.length;
 
@@ -319,15 +312,44 @@ const eliminarPoliza = async (id) => {
         </button>
       </div>
 
+      {/* ✅ BUSCADOR */}
+      <div className="mb-4">
+        <input
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value)}
+          placeholder="Buscar: póliza, placa, nombre, entidad, aseguradora, gestor, gestión…"
+          className="w-full max-w-xl border rounded px-3 py-2 shadow-sm"
+        />
+        {busqueda?.trim() && (
+          <div className="text-xs text-gray-500 mt-1">
+            Mostrando <b>{dataRender.length}</b> resultado(s) para: <b>{busqueda}</b>
+          </div>
+        )}
+      </div>
+
       {/* ====== CONTADORES EXTRA ====== */}
       <div className="flex flex-wrap gap-2 mb-4">
-        <div className="bg-blue-100 px-3 py-2 rounded shadow">🔵 Montadas: <b>{contadores.montadas}</b></div>
-        <div className="bg-purple-100 px-3 py-2 rounded shadow">🟣 Recaudadas: <b>{contadores.recaudadas}</b></div>
-        <div className="bg-green-100 px-3 py-2 rounded shadow">🟢 Firmadas: <b>{contadores.firmadas}</b></div>
-        <div className="bg-emerald-100 px-3 py-2 rounded shadow">💰 Desembolsadas: <b>{contadores.desembolsadas}</b></div>
-        <div className="bg-gray-100 px-3 py-2 rounded shadow">📝 Endoso SI: <b>{contadores.endosoSi}</b></div>
-        <div className="bg-orange-100 px-3 py-2 rounded shadow">📄 Certif. pendientes: <b>{contadores.certPend}</b></div>
-        <div className="bg-orange-100 px-3 py-2 rounded shadow">📩 Correo endoso pend.: <b>{contadores.correoPend}</b></div>
+        <div className="bg-blue-100 px-3 py-2 rounded shadow">
+          🔵 Montadas: <b>{contadores.montadas}</b>
+        </div>
+        <div className="bg-purple-100 px-3 py-2 rounded shadow">
+          🟣 Recaudadas: <b>{contadores.recaudadas}</b>
+        </div>
+        <div className="bg-green-100 px-3 py-2 rounded shadow">
+          🟢 Firmadas: <b>{contadores.firmadas}</b>
+        </div>
+        <div className="bg-emerald-100 px-3 py-2 rounded shadow">
+          💰 Desembolsadas: <b>{contadores.desembolsadas}</b>
+        </div>
+        <div className="bg-gray-100 px-3 py-2 rounded shadow">
+          📝 Endoso SI: <b>{contadores.endosoSi}</b>
+        </div>
+        <div className="bg-orange-100 px-3 py-2 rounded shadow">
+          📄 Certif. pendientes: <b>{contadores.certPend}</b>
+        </div>
+        <div className="bg-orange-100 px-3 py-2 rounded shadow">
+          📩 Correo endoso pend.: <b>{contadores.correoPend}</b>
+        </div>
       </div>
 
       {/* ====== BOTONES ====== */}
@@ -340,16 +362,6 @@ const eliminarPoliza = async (id) => {
           }`}
         >
           + Póliza Nueva
-        </button>
-
-        <button
-          onClick={borrarTodo}
-          disabled={!uid || dataRender.length === 0}
-          className={`px-4 py-2 rounded-lg text-white ${
-            uid && dataRender.length > 0 ? "bg-red-600" : "bg-red-300 cursor-not-allowed"
-          }`}
-        >
-          🗑 Borrar TODO (filtro actual)
         </button>
       </div>
 
@@ -398,7 +410,7 @@ const eliminarPoliza = async (id) => {
                             ? "bg-yellow-400"
                             : "bg-red-500"
                         } ${
-                          p.endoso === "SI" && p.desembolsada && !p.certificacion
+                          (p.endoso || "") === "SI" && !!p.desembolsada && !p.certificacion
                             ? "animate-pulse"
                             : ""
                         }`}
@@ -407,16 +419,16 @@ const eliminarPoliza = async (id) => {
                   </div>
 
                   <div className="flex flex-col gap-1 text-xs">
-                    {p.montada && <span className="text-blue-600">🔵 Montada</span>}
-                    {p.recaudada && <span className="text-purple-600">🟣 Recaudada</span>}
-                    {p.firmada && <span className="text-green-600">🟢 Firmada</span>}
-                    {p.desembolsada && <span className="text-green-700">💰 Desembolsada</span>}
+                    {!!p.montada && <span className="text-blue-600">🔵 Montada</span>}
+                    {!!p.recaudada && <span className="text-purple-600">🟣 Recaudada</span>}
+                    {!!p.firmada && <span className="text-green-600">🟢 Firmada</span>}
+                    {!!p.desembolsada && <span className="text-green-700">💰 Desembolsada</span>}
 
-                    {p.endoso === "SI" && !p.certificacion && p.desembolsada && (
+                    {(p.endoso || "") === "SI" && !p.certificacion && !!p.desembolsada && (
                       <span className="text-orange-500">📄 Certificación pendiente</span>
                     )}
 
-                    {p.endoso === "SI" && p.certificacion && !p.correoEndoso && (
+                    {(p.endoso || "") === "SI" && !!p.certificacion && !p.correoEndoso && (
                       <span className="text-orange-500">📩 Correo Endoso pendiente</span>
                     )}
 
@@ -553,7 +565,7 @@ const eliminarPoliza = async (id) => {
                 </td>
 
                 <td className="text-center">
-                  {p.endoso === "SI" && (
+                  {(p.endoso || "") === "SI" && (
                     <input
                       type="checkbox"
                       checked={!!p.certificacion}
@@ -564,7 +576,7 @@ const eliminarPoliza = async (id) => {
                 </td>
 
                 <td className="text-center">
-                  {p.endoso === "SI" && p.certificacion && (
+                  {(p.endoso || "") === "SI" && !!p.certificacion && (
                     <select
                       value={p.correoEndoso ? "SI" : "NO"}
                       onChange={(e) => guardarCampo(p.id, { correoEndoso: e.target.value === "SI" })}
@@ -600,7 +612,6 @@ const eliminarPoliza = async (id) => {
                   />
                 </td>
 
-                {/* ✅ NUEVO: GESTION TEXTO */}
                 <td>
                   <textarea
                     value={p.gestionTexto || ""}
