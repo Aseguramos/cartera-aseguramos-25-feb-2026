@@ -1,5 +1,6 @@
 import React, { useEffect, useState, Fragment } from "react";
 import { db } from "./firebase";
+import { getApp } from "firebase/app";
 import {
   onSnapshot,
   collection,
@@ -31,6 +32,8 @@ const aseguradorasFijas = [
 ];
 
 const VerCartera = () => {
+
+  console.log("🔥 PROJECT:", getApp().options.projectId);
   // --- UI / estado general ---
   const [data, setData] = useState([]);
   const [searchTerm, setSearchTerm] = useState("");
@@ -232,16 +235,25 @@ const VerCartera = () => {
   };
 
   useEffect(() => {
-    const unsubscribe = onSnapshot(collection(db, "cartera"), (snap) => {
+  const ref = collection(db, "cartera");
+
+  const unsubscribe = onSnapshot(
+    ref,
+    (snap) => {
+      console.log("📦 Docs encontrados:", snap.size);
       const documentos = snap.docs.map((d) => ({
         id: d.id,
         ...d.data(),
       }));
       setData(documentos);
-    });
+    },
+    (error) => {
+      console.error("❌ Error onSnapshot cartera:", error);
+    }
+  );
 
-    return () => unsubscribe();
-  }, []);
+  return () => unsubscribe();
+}, []);
 
   // ================== CONTADORES ==================
   useEffect(() => {

@@ -1,22 +1,35 @@
 import React, { useState } from "react";
+import { auth } from "./firebase";
+import { signInWithEmailAndPassword } from "firebase/auth";
 
 const Login = ({ onLogin }) => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
-    if (email === "ajlcartera@hotmail.com" && password === "Acartera31") {
+
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
       onLogin();
-    } else {
-      alert("Credenciales incorrectas");
-    }
+   } catch (error) {
+  console.log("LOGIN_ERROR_FULL", error);
+  console.log("LOGIN_ERROR_CODE", error.code);
+  console.log("LOGIN_ERROR_MESSAGE", error.message);
+  alert(`Error: ${error.code}`);
+}
   };
 
   return (
     <div className="flex items-center justify-center min-h-screen bg-gray-100">
-      <form onSubmit={handleLogin} className="bg-white p-8 rounded shadow-md w-80">
-        <h2 className="text-2xl mb-6 text-center font-bold">Iniciar Sesión</h2>
+      <form
+        onSubmit={handleLogin}
+        className="bg-white p-8 rounded shadow-md w-80"
+      >
+        <h2 className="text-2xl mb-6 text-center font-bold">
+          Iniciar Sesión
+        </h2>
+
         <input
           type="email"
           placeholder="Correo electrónico"
@@ -25,6 +38,7 @@ const Login = ({ onLogin }) => {
           className="w-full p-2 mb-4 border rounded"
           required
         />
+
         <input
           type="password"
           placeholder="Contraseña"
@@ -33,7 +47,11 @@ const Login = ({ onLogin }) => {
           className="w-full p-2 mb-6 border rounded"
           required
         />
-        <button type="submit" className="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600">
+
+        <button
+          type="submit"
+          className="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600"
+        >
           Entrar
         </button>
       </form>

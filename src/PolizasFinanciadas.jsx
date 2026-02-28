@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { db } from "./firebase";
+import { db, auth } from "./firebase";
 
 import {
   collection,
@@ -9,10 +9,12 @@ import {
   deleteDoc,
   doc,
   onSnapshot,
+  collectionGroup,
+  query,
+  where,
 } from "firebase/firestore";
 
-// ✅ Referencia Firestore (una sola, afuera)
-const refFinanciadas = collection(db, "polizasFinanciadas");
+import { onAuthStateChanged } from "firebase/auth";
 
 function getSemaforo(poliza) {
   if (poliza.endoso === "") return "rojo";
@@ -79,32 +81,120 @@ export default function PolizasFinanciadas() {
   ];
 
   const [carteraReal, setCarteraReal] = useState([]);
-  const [polizas, setPolizas] = useState([]); // ✅ SOLO Firestore manda
+  const [polizas, setPolizas] = useState([]);
+  const [uid, setUid] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
 
-  // (Dejas esto tal cual lo tenías, por si lo usas después)
+  // ✅ ADMIN: se valida por existencia de doc en /admins/{uid}
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  // ✅ UID con la MISMA instancia de auth del proyecto
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (user) => {
+      setUid(user ? user.uid : null);
+      setAuthReady(true);
+      console.log("AUTH USER:", user?.email, "UID:", user?.uid);
+    });
+    return () => unsub();
+  }, []);
+
+  // ✅ Detectar admin (si existe doc en admins/{uid})
+  useEffect(() => {
+    if (!uid) {
+      setIsAdmin(false);
+      return;
+    }
+
+    const ref = doc(db, "admins", uid);
+
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        setIsAdmin(snap.exists());
+        console.log("IS ADMIN:", snap.exists());
+      },
+      (err) => {
+        console.warn("⚠️ No se pudo verificar admin:", err);
+        setIsAdmin(false);
+      }
+    );
+
+    return () => unsub();
+  }, [uid]);
+
+  // (lo dejas por si lo usas después)
   useEffect(() => {
     const cargarCartera = async () => {
-      const querySnapshot = await getDocs(collection(db, "cartera"));
-      const datos = querySnapshot.docs.map((d) => d.data());
-      setCarteraReal(datos);
+      try {
+        const querySnapshot = await getDocs(collection(db, "cartera"));
+        const datos = querySnapshot.docs.map((d) => d.data());
+        setCarteraReal(datos);
+      } catch (e) {
+        console.warn("⚠️ cargarCartera no se pudo (no afecta financiadas):", e);
+      }
     };
     cargarCartera();
   }, []);
 
-  // ✅ Cargar en tiempo real SOLO las financiadas desde Firestore
+  // ✅ Carga realtime:
+  // - Normal: cartera/{uid}/polizasFinanciadas
+  // - Admin: collectionGroup("polizasFinanciadas") (todas)
   useEffect(() => {
-    const unsubscribe = onSnapshot(refFinanciadas, (snap) => {
-      const datos = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((p) => p.tipo === "financiada");
+    if (!uid) {
+      setPolizas([]);
+      return;
+    }
 
-      setPolizas(datos);
-    });
+    let unsubscribe = () => {};
+
+    // ✅ ADMIN: ve todo
+    if (isAdmin) {
+      const q = query(
+        collectionGroup(db, "polizasFinanciadas"),
+        where("tipo", "==", "financiada")
+      );
+
+      unsubscribe = onSnapshot(
+        q,
+        (snap) => {
+          const datos = snap.docs.map((d) => {
+            // ownerId = el documento padre (cartera/{ownerId}/polizasFinanciadas/{id})
+            const ownerId = d.ref.parent?.parent?.id || null;
+            return { id: d.id, ownerId, ...d.data() };
+          });
+
+          setPolizas(datos);
+        },
+        (err) => {
+          console.error("❌ onSnapshot ADMIN financiadas:", err);
+          alert("No se pudo leer financiadas (admin). Revisa reglas.");
+        }
+      );
+
+      return () => unsubscribe();
+    }
+
+    // ✅ NORMAL: solo las suyas
+    const refFinanciadas = collection(db, "cartera", uid, "polizasFinanciadas");
+
+    unsubscribe = onSnapshot(
+      refFinanciadas,
+      (snap) => {
+        const datos = snap.docs
+          .map((d) => ({ id: d.id, ownerId: uid, ...d.data() }))
+          .filter((p) => p.tipo === "financiada");
+
+        setPolizas(datos);
+      },
+      (err) => {
+        console.error("❌ onSnapshot financiadas:", err);
+        alert("No se pudo leer financiadas. Revisa reglas de Firestore.");
+      }
+    );
 
     return () => unsubscribe();
-  }, []);
+  }, [uid, isAdmin]);
 
-  // ✅ Plantilla limpia para nuevas
   const plantillaNueva = () => ({
     numeroPoliza: "",
     fecha: "",
@@ -128,70 +218,103 @@ export default function PolizasFinanciadas() {
     createdAt: Date.now(),
   });
 
-  // ✅ Crear en Firestore (y listo, el onSnapshot la trae)
   const agregarPoliza = async () => {
+    if (!uid) return;
+
     try {
+      const refFinanciadas = collection(db, "cartera", uid, "polizasFinanciadas");
       await addDoc(refFinanciadas, plantillaNueva());
     } catch (error) {
       console.error("❌ Error creando póliza financiada:", error);
-      alert("Error creando póliza. Revisa consola y permisos de Firebase.");
+      alert("Error creando póliza. Revisa consola y permisos/reglas.");
     }
   };
 
-  // ✅ Guardar cambios por campo (Firestore)
-  const guardarCampo = async (id, patch) => {
+  // ✅ si es admin y viene ownerId, guarda donde corresponde
+  const guardarCampo = async (id, patch, ownerIdOverride = null) => {
+    if (!uid) return;
+
+    const ownerId = ownerIdOverride || uid;
+
     try {
-      await updateDoc(doc(db, "polizasFinanciadas", id), patch);
+      await updateDoc(doc(db, "cartera", ownerId, "polizasFinanciadas", id), patch);
     } catch (error) {
       console.error("❌ Error guardando cambio:", error);
-      alert("No se pudo guardar el cambio. Revisa permisos o conexión.");
+      alert("No se pudo guardar. Revisa permisos/reglas o conexión.");
     }
   };
 
-  // ✅ Eliminar una póliza (Firestore)
-  const eliminarPoliza = async (id) => {
+  const eliminarPoliza = async (id, ownerIdOverride = null) => {
     const ok = window.confirm("¿Seguro que quieres eliminar esta póliza financiada?");
-    if (!ok) return;
+    if (!ok || !uid) return;
+
+    const ownerId = ownerIdOverride || uid;
 
     try {
-      await deleteDoc(doc(db, "polizasFinanciadas", id));
+      await deleteDoc(doc(db, "cartera", ownerId, "polizasFinanciadas", id));
     } catch (error) {
       console.error("❌ Error eliminando póliza:", error);
-      alert("No se pudo eliminar. Revisa permisos o conexión.");
+      alert("No se pudo eliminar. Revisa permisos/reglas o conexión.");
     }
   };
 
-  // ✅ Borrar TODO (solo las financiadas)
   const borrarTodo = async () => {
-    const ok = window.confirm("⚠️ Esto eliminará TODAS las pólizas financiadas. ¿Continuar?");
-    if (!ok) return;
+    const ok = window.confirm("⚠️ Esto eliminará TODAS las pólizas financiadas visibles. ¿Continuar?");
+    if (!ok || !uid) return;
 
     try {
-      // polizas ya viene filtrado por tipo financiada
       for (const p of polizas) {
-        await deleteDoc(doc(db, "polizasFinanciadas", p.id));
+        const ownerId = p.ownerId || uid;
+        await deleteDoc(doc(db, "cartera", ownerId, "polizasFinanciadas", p.id));
       }
     } catch (error) {
       console.error("❌ Error borrando todo:", error);
-      alert("No se pudo borrar todo. Revisa permisos o conexión.");
+      alert("No se pudo borrar todo. Revisa permisos/reglas o conexión.");
     }
   };
 
+  const sinSesion = authReady && !uid;
+
   return (
     <div className="pl-0 pr-4 pt-4 pb-4 w-full text-left">
-      <h2 className="text-xl font-bold mb-4">Pólizas Financiadas</h2>
+      <h2 className="text-xl font-bold mb-2">Pólizas Financiadas</h2>
+
+      {/* ✅ Ocultamos UID en pantalla, pero dejamos info útil */}
+      {!authReady && (
+        <div className="text-sm text-gray-500 mb-3">Cargando sesión…</div>
+      )}
+      {sinSesion && (
+        <div className="text-sm text-red-600 mb-3">
+          Sin sesión activa. Inicia sesión para ver/agregar pólizas.
+        </div>
+      )}
+      {authReady && uid && (
+        <div className="text-xs mb-3">
+          {isAdmin ? (
+            <span className="text-green-700 font-semibold">Modo ADMIN: viendo todas las pólizas</span>
+          ) : (
+            <span className="text-gray-600">Viendo tus pólizas</span>
+          )}
+        </div>
+      )}
 
       <div className="flex gap-3 mb-4">
         <button
           onClick={agregarPoliza}
-          className="bg-green-600 text-white px-4 py-2 rounded-lg"
+          disabled={!uid}
+          className={`px-4 py-2 rounded-lg text-white ${
+            uid ? "bg-green-600" : "bg-green-300 cursor-not-allowed"
+          }`}
         >
           + Póliza Nueva
         </button>
 
         <button
           onClick={borrarTodo}
-          className="bg-red-600 text-white px-4 py-2 rounded-lg"
+          disabled={!uid || polizas.length === 0}
+          className={`px-4 py-2 rounded-lg text-white ${
+            uid && polizas.length > 0 ? "bg-red-600" : "bg-red-300 cursor-not-allowed"
+          }`}
         >
           🗑 Borrar TODO
         </button>
@@ -226,12 +349,12 @@ export default function PolizasFinanciadas() {
         <tbody>
           {polizas.map((p) => {
             const estado = getSemaforo(p);
+            const ownerId = p.ownerId || uid;
 
             return (
-              <tr key={p.id} className="border-b">
+              <tr key={`${ownerId}_${p.id}`} className="border-b">
                 <td>
                   <div className="flex items-start gap-3">
-                    {/* 🔵 SEMÁFORO GENERAL GRANDE */}
                     <div>
                       <span
                         className={`inline-flex items-center justify-center w-9 h-9 rounded-full border-2 border-white shadow-lg ${
@@ -249,7 +372,6 @@ export default function PolizasFinanciadas() {
                     </div>
                   </div>
 
-                  {/* 🧾 DETALLE PROCESO */}
                   <div className="flex flex-col gap-1 text-xs">
                     {p.montada && <span className="text-blue-600">🔵 Montada</span>}
                     {p.recaudada && <span className="text-purple-600">🟣 Recaudada</span>}
@@ -278,7 +400,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="date"
                     value={p.fecha || ""}
-                    onChange={(e) => guardarCampo(p.id, { fecha: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { fecha: e.target.value }, ownerId)}
                     className="border rounded px-2 py-1"
                   />
                 </td>
@@ -287,7 +409,7 @@ export default function PolizasFinanciadas() {
                   <input
                     value={p.numeroPoliza || ""}
                     onChange={(e) =>
-                      guardarCampo(p.id, { numeroPoliza: e.target.value })
+                      guardarCampo(p.id, { numeroPoliza: e.target.value }, ownerId)
                     }
                     className="border rounded px-2 py-1 w-28"
                   />
@@ -296,7 +418,9 @@ export default function PolizasFinanciadas() {
                 <td>
                   <select
                     value={p.aseguradora || "SURA"}
-                    onChange={(e) => guardarCampo(p.id, { aseguradora: e.target.value })}
+                    onChange={(e) =>
+                      guardarCampo(p.id, { aseguradora: e.target.value }, ownerId)
+                    }
                     className="border rounded px-2 py-1"
                   >
                     {aseguradorasLista.map((a) => (
@@ -309,7 +433,11 @@ export default function PolizasFinanciadas() {
                   <input
                     value={p.placa || ""}
                     onChange={(e) =>
-                      guardarCampo(p.id, { placa: (e.target.value || "").toUpperCase() })
+                      guardarCampo(
+                        p.id,
+                        { placa: (e.target.value || "").toUpperCase() },
+                        ownerId
+                      )
                     }
                     className="border rounded px-2 py-1 w-24"
                   />
@@ -318,7 +446,7 @@ export default function PolizasFinanciadas() {
                 <td>
                   <input
                     value={p.nombre || ""}
-                    onChange={(e) => guardarCampo(p.id, { nombre: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { nombre: e.target.value }, ownerId)}
                     className="border rounded px-2 py-1 w-32"
                   />
                 </td>
@@ -326,7 +454,7 @@ export default function PolizasFinanciadas() {
                 <td>
                   <select
                     value={p.entidad || "Finesa"}
-                    onChange={(e) => guardarCampo(p.id, { entidad: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { entidad: e.target.value }, ownerId)}
                     className="border rounded px-2 py-1"
                   >
                     {entidadesLista.map((ent) => (
@@ -339,7 +467,7 @@ export default function PolizasFinanciadas() {
                   <select
                     value={Number(p.cuotas || 1)}
                     onChange={(e) =>
-                      guardarCampo(p.id, { cuotas: Number(e.target.value) })
+                      guardarCampo(p.id, { cuotas: Number(e.target.value) }, ownerId)
                     }
                     className="border rounded px-2 py-1"
                   >
@@ -352,7 +480,7 @@ export default function PolizasFinanciadas() {
                 <td>
                   <input
                     value={p.valor || ""}
-                    onChange={(e) => guardarCampo(p.id, { valor: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { valor: e.target.value }, ownerId)}
                     className="border rounded px-2 py-1 w-28"
                   />
                 </td>
@@ -361,7 +489,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.montada}
-                    onChange={(e) => guardarCampo(p.id, { montada: e.target.checked })}
+                    onChange={(e) => guardarCampo(p.id, { montada: e.target.checked }, ownerId)}
                   />
                 </td>
 
@@ -370,7 +498,7 @@ export default function PolizasFinanciadas() {
                     type="checkbox"
                     checked={!!p.recaudada}
                     disabled={!p.montada}
-                    onChange={(e) => guardarCampo(p.id, { recaudada: e.target.checked })}
+                    onChange={(e) => guardarCampo(p.id, { recaudada: e.target.checked }, ownerId)}
                   />
                 </td>
 
@@ -379,7 +507,7 @@ export default function PolizasFinanciadas() {
                     type="checkbox"
                     checked={!!p.firmada}
                     disabled={!p.recaudada}
-                    onChange={(e) => guardarCampo(p.id, { firmada: e.target.checked })}
+                    onChange={(e) => guardarCampo(p.id, { firmada: e.target.checked }, ownerId)}
                   />
                 </td>
 
@@ -389,7 +517,7 @@ export default function PolizasFinanciadas() {
                     checked={!!p.desembolsada}
                     disabled={!p.montada || !p.recaudada || !p.firmada}
                     onChange={(e) =>
-                      guardarCampo(p.id, { desembolsada: e.target.checked })
+                      guardarCampo(p.id, { desembolsada: e.target.checked }, ownerId)
                     }
                   />
                 </td>
@@ -397,7 +525,7 @@ export default function PolizasFinanciadas() {
                 <td className="text-center">
                   <select
                     value={p.endoso || ""}
-                    onChange={(e) => guardarCampo(p.id, { endoso: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { endoso: e.target.value }, ownerId)}
                     className="border rounded px-1"
                   >
                     <option value="">-</option>
@@ -413,19 +541,18 @@ export default function PolizasFinanciadas() {
                       checked={!!p.certificacion}
                       disabled={!p.desembolsada}
                       onChange={(e) =>
-                        guardarCampo(p.id, { certificacion: e.target.checked })
+                        guardarCampo(p.id, { certificacion: e.target.checked }, ownerId)
                       }
                     />
                   )}
                 </td>
 
-                {/* 🆕 CORREO ENDOSO */}
                 <td className="text-center">
                   {p.endoso === "SI" && p.certificacion && (
                     <select
                       value={p.correoEndoso ? "SI" : "NO"}
                       onChange={(e) =>
-                        guardarCampo(p.id, { correoEndoso: e.target.value === "SI" })
+                        guardarCampo(p.id, { correoEndoso: e.target.value === "SI" }, ownerId)
                       }
                       className="border rounded px-1"
                     >
@@ -439,14 +566,14 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.delegada}
-                    onChange={(e) => guardarCampo(p.id, { delegada: e.target.checked })}
+                    onChange={(e) => guardarCampo(p.id, { delegada: e.target.checked }, ownerId)}
                   />
                 </td>
 
                 <td>
                   <input
                     value={p.delegadaA || ""}
-                    onChange={(e) => guardarCampo(p.id, { delegadaA: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { delegadaA: e.target.value }, ownerId)}
                     className="border rounded px-2 py-1 w-32"
                   />
                 </td>
@@ -454,14 +581,14 @@ export default function PolizasFinanciadas() {
                 <td>
                   <input
                     value={p.gestor || ""}
-                    onChange={(e) => guardarCampo(p.id, { gestor: e.target.value })}
+                    onChange={(e) => guardarCampo(p.id, { gestor: e.target.value }, ownerId)}
                     className="border rounded px-2 py-1 w-32"
                   />
                 </td>
 
                 <td>
                   <button
-                    onClick={() => eliminarPoliza(p.id)}
+                    onClick={() => eliminarPoliza(p.id, ownerId)}
                     className="text-red-600 font-bold px-2"
                     title="Eliminar"
                   >
