@@ -13,5 +13,9 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 
+
+console.log("🔥 FIREBASE PROJECT:", app.options.projectId);
+console.log("🔥 AUTH DOMAIN:", app.options.authDomain);
+
 export const auth = getAuth(app);   // 👈 SIMPLE Y CORRECTO
 export const db = getFirestore(app);
