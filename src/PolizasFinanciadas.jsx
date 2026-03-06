@@ -128,9 +128,11 @@ export default function PolizasFinanciadas() {
   const [fechaHasta, setFechaHasta] = useState("");
   const [soloBloqueadas, setSoloBloqueadas] = useState(false);
 
-  // nuevo filtro por vencimiento
+  // filtro por vencimiento
   const [filtroVencimiento, setFiltroVencimiento] = useState("todas");
-  // todas | urgente | proxima | tranquila | sin_fecha
+
+  // ✅ NUEVO: buscador
+  const [busqueda, setBusqueda] = useState("");
 
   const autolockProcesadas = useRef(new Set());
 
@@ -262,6 +264,19 @@ export default function PolizasFinanciadas() {
       arr = arr.filter((p) => getSemaforoFecha(p) === filtroVencimiento);
     }
 
+    // ✅ NUEVO: buscador por póliza, placa, nombre, gestor y delegado
+    if (busqueda.trim() !== "") {
+      const b = busqueda.toLowerCase();
+
+      arr = arr.filter((p) =>
+        (p.numeroPoliza || "").toLowerCase().includes(b) ||
+        (p.placa || "").toLowerCase().includes(b) ||
+        (p.nombre || "").toLowerCase().includes(b) ||
+        (p.gestor || "").toLowerCase().includes(b) ||
+        (p.delegadaA || "").toLowerCase().includes(b)
+      );
+    }
+
     // ordenar por fecha: más antigua primero
     arr = [...arr].sort((a, b) => {
       const fa = a.fecha || "";
@@ -275,7 +290,15 @@ export default function PolizasFinanciadas() {
     });
 
     return arr;
-  }, [polizas, filtroSemaforo, fechaDesde, fechaHasta, soloBloqueadas, filtroVencimiento]);
+  }, [
+    polizas,
+    filtroSemaforo,
+    fechaDesde,
+    fechaHasta,
+    soloBloqueadas,
+    filtroVencimiento,
+    busqueda,
+  ]);
 
   const contadores = useMemo(() => {
     const total = polizas.length;
@@ -431,9 +454,13 @@ export default function PolizasFinanciadas() {
             setFiltroSemaforo("todas");
             setSoloBloqueadas(false);
             setFiltroVencimiento("todas");
+            setBusqueda("");
           }}
           className={`px-4 py-2 rounded shadow ${
-            filtroSemaforo === "todas" && !soloBloqueadas && filtroVencimiento === "todas"
+            filtroSemaforo === "todas" &&
+            !soloBloqueadas &&
+            filtroVencimiento === "todas" &&
+            busqueda === ""
               ? "bg-blue-700 text-white"
               : "bg-blue-100"
           }`}
@@ -496,10 +523,10 @@ export default function PolizasFinanciadas() {
         </button>
       </div>
 
-      {/* FILTRO FECHAS */}
+      {/* FILTROS DE FECHA + BUSCADOR */}
       <div className="flex flex-wrap gap-2 items-end mb-4">
         <div className="bg-white shadow rounded px-3 py-2 border">
-          <div className="text-xs text-gray-600 mb-1">Filtrar por fecha</div>
+          <div className="text-xs text-gray-600 mb-1">Filtrar</div>
           <div className="flex flex-wrap gap-2 items-center">
             <div className="flex flex-col">
               <label className="text-xs text-gray-500">Desde</label>
@@ -526,8 +553,19 @@ export default function PolizasFinanciadas() {
               className="px-3 py-2 rounded bg-gray-100 border hover:bg-gray-200"
               type="button"
             >
-              Limpiar
+              Limpiar fechas
             </button>
+
+            <div className="flex flex-col">
+              <label className="text-xs text-gray-500">Buscar</label>
+              <input
+                type="text"
+                value={busqueda}
+                onChange={(e) => setBusqueda(e.target.value)}
+                className="border rounded px-3 py-2 w-96"
+                placeholder="Póliza, placa, nombre, gestor o delegado..."
+              />
+            </div>
 
             <div className="text-xs text-gray-600">
               Mostrando: <b>{dataRender.length}</b>
