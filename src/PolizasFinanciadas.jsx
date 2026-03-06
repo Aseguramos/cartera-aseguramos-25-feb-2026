@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { db, auth } from "./firebase";
 
 import {
@@ -23,7 +23,6 @@ function getSemaforo(poliza) {
   const baseParcial =
     !!poliza.montada || !!poliza.recaudada || !!poliza.firmada || !!poliza.desembolsada;
 
-  // 🟡 Delegada
   if (!!poliza.delegada) {
     if ((poliza.endoso || "") === "SI") {
       if (baseCompleta && !!poliza.certificacion && !!poliza.correoEndoso) return "verde";
@@ -33,18 +32,59 @@ function getSemaforo(poliza) {
     return "amarillo";
   }
 
-  // 🟣 ENDOSO SI
   if ((poliza.endoso || "") === "SI") {
     if (baseCompleta && !!poliza.certificacion && !!poliza.correoEndoso) return "verde";
     if (baseParcial || !!poliza.certificacion) return "amarillo";
     return "rojo";
   }
 
-  // 🟢 ENDOSO NO
   if (baseCompleta) return "verde";
   if (baseParcial) return "amarillo";
 
   return "rojo";
+}
+
+function inRangeISO(dateISO, desdeISO, hastaISO) {
+  const d = (dateISO || "").trim();
+  if (!d) return false;
+  if (desdeISO && d < desdeISO) return false;
+  if (hastaISO && d > hastaISO) return false;
+  return true;
+}
+
+// ✅ DÍAS TRANSCURRIDOS DESDE LA FECHA
+function diasDesdeFecha(fechaISO) {
+  if (!fechaISO) return null;
+
+  const [y, m, d] = fechaISO.split("-").map(Number);
+  if (!y || !m || !d) return null;
+
+  const fecha = new Date(y, m - 1, d);
+  const hoy = new Date();
+
+  const fecha0 = new Date(fecha.getFullYear(), fecha.getMonth(), fecha.getDate());
+  const hoy0 = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate());
+
+  return Math.floor((hoy0.getTime() - fecha0.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+// ✅ SEMÁFORO SEGÚN DÍAS TRANSCURRIDOS
+function getSemaforoFecha(poliza) {
+  const dias = diasDesdeFecha(poliza.fecha);
+
+  if (dias === null) return "sin_fecha";
+
+  // Si ya está finalizada, queda tranquila
+  if (getSemaforo(poliza) === "verde") return "tranquila";
+
+  // 0 a 2 días transcurridos
+  if (dias <= 2) return "tranquila";
+
+  // 3 a 5 días transcurridos
+  if (dias >= 3 && dias <= 5) return "proxima";
+
+  // 6 días o más transcurridos
+  return "urgente";
 }
 
 export default function PolizasFinanciadas() {
@@ -83,12 +123,17 @@ export default function PolizasFinanciadas() {
   const [authReady, setAuthReady] = useState(false);
 
   // filtros
-  const [filtroSemaforo, setFiltroSemaforo] = useState("todas"); // todas | rojo | amarillo | verde
+  const [filtroSemaforo, setFiltroSemaforo] = useState("todas");
+  const [fechaDesde, setFechaDesde] = useState("");
+  const [fechaHasta, setFechaHasta] = useState("");
+  const [soloBloqueadas, setSoloBloqueadas] = useState(false);
 
-  // ✅ BUSCADOR
-  const [busqueda, setBusqueda] = useState("");
+  // nuevo filtro por vencimiento
+  const [filtroVencimiento, setFiltroVencimiento] = useState("todas");
+  // todas | urgente | proxima | tranquila | sin_fecha
 
-  // ✅ Sesión
+  const autolockProcesadas = useRef(new Set());
+
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       setUid(user ? user.uid : null);
@@ -98,7 +143,6 @@ export default function PolizasFinanciadas() {
     return () => unsub();
   }, []);
 
-  // ✅ Carga realtime desde SUBCOLECCIÓN por UID: cartera/{uid}/polizasFinanciadas
   useEffect(() => {
     if (!uid) {
       setPolizas([]);
@@ -147,11 +191,11 @@ export default function PolizasFinanciadas() {
     gestionTexto: "",
     tipo: "financiada",
     createdAt: Date.now(),
+    bloqueada: false,
   });
 
   const agregarPoliza = async () => {
     if (!uid) return;
-
     try {
       await addDoc(collection(db, "cartera", uid, "polizasFinanciadas"), plantillaNueva());
     } catch (error) {
@@ -182,45 +226,57 @@ export default function PolizasFinanciadas() {
     }
   };
 
+  const borrarTodo = async (dataRender) => {
+    const ok = window.confirm("⚠️ Esto eliminará TODAS las pólizas financiadas visibles. ¿Continuar?");
+    if (!ok || !uid) return;
+
+    try {
+      for (const p of dataRender) {
+        if (p.bloqueada) continue;
+        await deleteDoc(doc(db, "cartera", uid, "polizasFinanciadas", p.id));
+      }
+    } catch (error) {
+      console.error("❌ Error borrando todo:", error);
+      alert("No se pudo borrar todo. Revisa permisos/reglas o conexión.");
+    }
+  };
+
   const sinSesion = authReady && !uid;
 
-  // =========================
-  // FILTRO + BUSCADOR
-  // =========================
   const dataRender = useMemo(() => {
-    const q = (busqueda || "").trim().toLowerCase();
+    let arr = polizas;
 
-    let base = polizas;
-
-    // 1) filtro por semáforo
     if (filtroSemaforo !== "todas") {
-      base = base.filter((p) => getSemaforo(p) === filtroSemaforo);
+      arr = arr.filter((p) => getSemaforo(p) === filtroSemaforo);
     }
 
-    // 2) filtro por búsqueda
-    if (!q) return base;
+    if (fechaDesde || fechaHasta) {
+      arr = arr.filter((p) => inRangeISO(p.fecha, fechaDesde, fechaHasta));
+    }
 
-    return base.filter((p) => {
-      const texto = [
-        p.numeroPoliza,
-        p.placa,
-        p.nombre,
-        p.entidad,
-        p.aseguradora,
-        p.gestor,
-        p.gestionTexto,
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
+    if (soloBloqueadas) {
+      arr = arr.filter((p) => !!p.bloqueada);
+    }
 
-      return texto.includes(q);
+    if (filtroVencimiento !== "todas") {
+      arr = arr.filter((p) => getSemaforoFecha(p) === filtroVencimiento);
+    }
+
+    // ordenar por fecha: más antigua primero
+    arr = [...arr].sort((a, b) => {
+      const fa = a.fecha || "";
+      const fb = b.fecha || "";
+
+      if (!fa && !fb) return 0;
+      if (!fa) return 1;
+      if (!fb) return -1;
+
+      return fa.localeCompare(fb);
     });
-  }, [polizas, filtroSemaforo, busqueda]);
 
-  // =========================
-  // CONTADORES
-  // =========================
+    return arr;
+  }, [polizas, filtroSemaforo, fechaDesde, fechaHasta, soloBloqueadas, filtroVencimiento]);
+
   const contadores = useMemo(() => {
     const total = polizas.length;
 
@@ -243,6 +299,13 @@ export default function PolizasFinanciadas() {
       (p) => (p.endoso || "") === "SI" && !!p.certificacion && !p.correoEndoso
     ).length;
 
+    const bloqueadas = polizas.filter((p) => !!p.bloqueada).length;
+
+    const urgentes = polizas.filter((p) => getSemaforoFecha(p) === "urgente").length;
+    const proximas = polizas.filter((p) => getSemaforoFecha(p) === "proxima").length;
+    const tranquilas = polizas.filter((p) => getSemaforoFecha(p) === "tranquila").length;
+    const sinFecha = polizas.filter((p) => getSemaforoFecha(p) === "sin_fecha").length;
+
     return {
       total,
       rojas,
@@ -255,8 +318,62 @@ export default function PolizasFinanciadas() {
       endosoSi,
       certPend,
       correoPend,
+      bloqueadas,
+      urgentes,
+      proximas,
+      tranquilas,
+      sinFecha,
     };
   }, [polizas]);
+
+  useEffect(() => {
+    if (!uid) return;
+
+    const verdesNoBloqueadas = polizas.filter(
+      (p) => getSemaforo(p) === "verde" && !p.bloqueada
+    );
+
+    if (verdesNoBloqueadas.length === 0) return;
+
+    verdesNoBloqueadas.forEach(async (p) => {
+      if (autolockProcesadas.current.has(p.id)) return;
+      autolockProcesadas.current.add(p.id);
+
+      try {
+        await updateDoc(doc(db, "cartera", uid, "polizasFinanciadas", p.id), {
+          bloqueada: true,
+          bloqueadaAt: Date.now(),
+        });
+      } catch (e) {
+        console.error("❌ Error auto-bloqueando póliza:", p.id, e);
+        autolockProcesadas.current.delete(p.id);
+      }
+    });
+  }, [polizas, uid]);
+
+  const toggleBloqueo = async (p, nuevoEstado) => {
+    if (!uid) return;
+
+    if (!nuevoEstado) {
+      const ok = window.confirm("¿Desbloquear esta fila? (podrás editar y desmarcar)");
+      if (!ok) return;
+    }
+
+    try {
+      await updateDoc(doc(db, "cartera", uid, "polizasFinanciadas", p.id), {
+        bloqueada: nuevoEstado,
+        bloqueadaAt: nuevoEstado ? (p.bloqueadaAt || Date.now()) : null,
+      });
+    } catch (e) {
+      console.error("❌ Error cambiando bloqueo:", e);
+      alert("No se pudo cambiar el bloqueo. Revisa permisos/conexión.");
+    }
+  };
+
+  const limpiarFechas = () => {
+    setFechaDesde("");
+    setFechaHasta("");
+  };
 
   return (
     <div className="pl-0 pr-4 pt-4 pb-4 w-full text-left">
@@ -269,10 +386,14 @@ export default function PolizasFinanciadas() {
         </div>
       )}
 
-      {/* ====== CONTADORES + FILTROS ====== */}
-      <div className="flex flex-wrap gap-2 items-center mb-4">
+      {/* CONTADORES + FILTROS SEMÁFORO PROCESO */}
+      <div className="flex flex-wrap gap-2 items-center mb-3">
         <div className="bg-indigo-200 text-indigo-900 px-4 py-2 rounded shadow">
           <b>Total:</b> {contadores.total}
+        </div>
+
+        <div className="bg-gray-200 text-gray-900 px-4 py-2 rounded shadow">
+          🔒 <b>Bloqueadas:</b> {contadores.bloqueadas}
         </div>
 
         <button
@@ -280,6 +401,7 @@ export default function PolizasFinanciadas() {
           className={`px-4 py-2 rounded shadow text-white ${
             filtroSemaforo === "rojo" ? "bg-red-700" : "bg-red-500"
           }`}
+          type="button"
         >
           Rojas: {contadores.rojas}
         </button>
@@ -289,6 +411,7 @@ export default function PolizasFinanciadas() {
           className={`px-4 py-2 rounded shadow ${
             filtroSemaforo === "amarillo" ? "bg-yellow-500" : "bg-yellow-300"
           }`}
+          type="button"
         >
           Amarillas: {contadores.amarillas}
         </button>
@@ -298,36 +421,122 @@ export default function PolizasFinanciadas() {
           className={`px-4 py-2 rounded shadow text-white ${
             filtroSemaforo === "verde" ? "bg-green-700" : "bg-green-500"
           }`}
+          type="button"
         >
           Verdes: {contadores.verdes}
         </button>
 
         <button
-          onClick={() => setFiltroSemaforo("todas")}
+          onClick={() => {
+            setFiltroSemaforo("todas");
+            setSoloBloqueadas(false);
+            setFiltroVencimiento("todas");
+          }}
           className={`px-4 py-2 rounded shadow ${
-            filtroSemaforo === "todas" ? "bg-blue-700 text-white" : "bg-blue-100"
+            filtroSemaforo === "todas" && !soloBloqueadas && filtroVencimiento === "todas"
+              ? "bg-blue-700 text-white"
+              : "bg-blue-100"
           }`}
+          type="button"
         >
           Todas
         </button>
+
+        <button
+          onClick={() => setSoloBloqueadas((v) => !v)}
+          className={`px-4 py-2 rounded shadow ${
+            soloBloqueadas ? "bg-gray-800 text-white" : "bg-gray-200 text-gray-900"
+          }`}
+          type="button"
+        >
+          🔒 Solo Bloqueadas: {contadores.bloqueadas}
+        </button>
       </div>
 
-      {/* ✅ BUSCADOR */}
-      <div className="mb-4">
-        <input
-          value={busqueda}
-          onChange={(e) => setBusqueda(e.target.value)}
-          placeholder="Buscar: póliza, placa, nombre, entidad, aseguradora, gestor, gestión…"
-          className="w-full max-w-xl border rounded px-3 py-2 shadow-sm"
-        />
-        {busqueda?.trim() && (
-          <div className="text-xs text-gray-500 mt-1">
-            Mostrando <b>{dataRender.length}</b> resultado(s) para: <b>{busqueda}</b>
+      {/* CONTADORES + FILTROS VENCIMIENTO */}
+      <div className="flex flex-wrap gap-2 items-center mb-4">
+        <button
+          onClick={() => setFiltroVencimiento("urgente")}
+          className={`px-4 py-2 rounded shadow text-white ${
+            filtroVencimiento === "urgente" ? "bg-red-700" : "bg-red-500"
+          }`}
+          type="button"
+        >
+          🚨 Urgentes (6+ días): {contadores.urgentes}
+        </button>
+
+        <button
+          onClick={() => setFiltroVencimiento("proxima")}
+          className={`px-4 py-2 rounded shadow ${
+            filtroVencimiento === "proxima" ? "bg-yellow-500" : "bg-yellow-300"
+          }`}
+          type="button"
+        >
+          ⏳ Próximas (3-5 días): {contadores.proximas}
+        </button>
+
+        <button
+          onClick={() => setFiltroVencimiento("tranquila")}
+          className={`px-4 py-2 rounded shadow text-white ${
+            filtroVencimiento === "tranquila" ? "bg-green-700" : "bg-green-500"
+          }`}
+          type="button"
+        >
+          ✅ Tranquilas (0-2 días): {contadores.tranquilas}
+        </button>
+
+        <button
+          onClick={() => setFiltroVencimiento("sin_fecha")}
+          className={`px-4 py-2 rounded shadow text-white ${
+            filtroVencimiento === "sin_fecha" ? "bg-gray-700" : "bg-gray-500"
+          }`}
+          type="button"
+        >
+          📅 Sin fecha: {contadores.sinFecha}
+        </button>
+      </div>
+
+      {/* FILTRO FECHAS */}
+      <div className="flex flex-wrap gap-2 items-end mb-4">
+        <div className="bg-white shadow rounded px-3 py-2 border">
+          <div className="text-xs text-gray-600 mb-1">Filtrar por fecha</div>
+          <div className="flex flex-wrap gap-2 items-center">
+            <div className="flex flex-col">
+              <label className="text-xs text-gray-500">Desde</label>
+              <input
+                type="date"
+                value={fechaDesde}
+                onChange={(e) => setFechaDesde(e.target.value)}
+                className="border rounded px-2 py-1"
+              />
+            </div>
+
+            <div className="flex flex-col">
+              <label className="text-xs text-gray-500">Hasta</label>
+              <input
+                type="date"
+                value={fechaHasta}
+                onChange={(e) => setFechaHasta(e.target.value)}
+                className="border rounded px-2 py-1"
+              />
+            </div>
+
+            <button
+              onClick={limpiarFechas}
+              className="px-3 py-2 rounded bg-gray-100 border hover:bg-gray-200"
+              type="button"
+            >
+              Limpiar
+            </button>
+
+            <div className="text-xs text-gray-600">
+              Mostrando: <b>{dataRender.length}</b>
+            </div>
           </div>
-        )}
+        </div>
       </div>
 
-      {/* ====== CONTADORES EXTRA ====== */}
+      {/* CONTADORES EXTRA */}
       <div className="flex flex-wrap gap-2 mb-4">
         <div className="bg-blue-100 px-3 py-2 rounded shadow">
           🔵 Montadas: <b>{contadores.montadas}</b>
@@ -352,7 +561,7 @@ export default function PolizasFinanciadas() {
         </div>
       </div>
 
-      {/* ====== BOTONES ====== */}
+      {/* BOTONES */}
       <div className="flex gap-3 mb-4">
         <button
           onClick={agregarPoliza}
@@ -363,14 +572,25 @@ export default function PolizasFinanciadas() {
         >
           + Póliza Nueva
         </button>
+
+        <button
+          onClick={() => borrarTodo(dataRender)}
+          disabled={!uid || dataRender.length === 0}
+          className={`px-4 py-2 rounded-lg text-white ${
+            uid && dataRender.length > 0 ? "bg-red-600" : "bg-red-300 cursor-not-allowed"
+          }`}
+        >
+          🗑 Borrar TODO (filtro actual)
+        </button>
       </div>
 
-      {/* ====== TABLA ====== */}
+      {/* TABLA */}
       <table className="w-full border table-auto -ml-64">
         <thead className="bg-gray-100">
           <tr>
             <th>Estado</th>
             <th>Fecha</th>
+            <th>Vencimiento</th>
             <th>Póliza</th>
             <th>Aseguradora</th>
             <th>Placa</th>
@@ -396,9 +616,16 @@ export default function PolizasFinanciadas() {
         <tbody>
           {dataRender.map((p) => {
             const estado = getSemaforo(p);
+            const bloqueada = !!p.bloqueada;
+            const venc = getSemaforoFecha(p);
+            const dias = diasDesdeFecha(p.fecha);
 
             return (
-              <tr key={p.id} className="border-b">
+              <tr
+                key={p.id}
+                className={`border-b ${bloqueada ? "opacity-70" : ""}`}
+                title={bloqueada ? "Fila bloqueada (no editable)" : ""}
+              >
                 <td>
                   <div className="flex items-start gap-3">
                     <div>
@@ -410,30 +637,52 @@ export default function PolizasFinanciadas() {
                             ? "bg-yellow-400"
                             : "bg-red-500"
                         } ${
-                          (p.endoso || "") === "SI" && !!p.desembolsada && !p.certificacion
+                          p.endoso === "SI" && p.desembolsada && !p.certificacion
                             ? "animate-pulse"
                             : ""
                         }`}
                       />
                     </div>
+
+                    <div className="flex flex-col gap-1">
+                      {bloqueada ? (
+                        <button
+                          onClick={() => toggleBloqueo(p, false)}
+                          className="text-xs px-2 py-1 rounded bg-gray-200 hover:bg-gray-300"
+                          type="button"
+                        >
+                          🔓 Desbloquear
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => toggleBloqueo(p, true)}
+                          className="text-xs px-2 py-1 rounded bg-gray-100 border hover:bg-gray-200"
+                          type="button"
+                        >
+                          🔒 Bloquear
+                        </button>
+                      )}
+                    </div>
                   </div>
 
-                  <div className="flex flex-col gap-1 text-xs">
-                    {!!p.montada && <span className="text-blue-600">🔵 Montada</span>}
-                    {!!p.recaudada && <span className="text-purple-600">🟣 Recaudada</span>}
-                    {!!p.firmada && <span className="text-green-600">🟢 Firmada</span>}
-                    {!!p.desembolsada && <span className="text-green-700">💰 Desembolsada</span>}
+                  <div className="flex flex-col gap-1 text-xs mt-2">
+                    {p.montada && <span className="text-blue-600">🔵 Montada</span>}
+                    {p.recaudada && <span className="text-purple-600">🟣 Recaudada</span>}
+                    {p.firmada && <span className="text-green-600">🟢 Firmada</span>}
+                    {p.desembolsada && <span className="text-green-700">💰 Desembolsada</span>}
 
-                    {(p.endoso || "") === "SI" && !p.certificacion && !!p.desembolsada && (
+                    {p.endoso === "SI" && !p.certificacion && p.desembolsada && (
                       <span className="text-orange-500">📄 Certificación pendiente</span>
                     )}
 
-                    {(p.endoso || "") === "SI" && !!p.certificacion && !p.correoEndoso && (
+                    {p.endoso === "SI" && p.certificacion && !p.correoEndoso && (
                       <span className="text-orange-500">📩 Correo Endoso pendiente</span>
                     )}
 
                     {estado === "verde" && (
-                      <span className="text-green-700 font-semibold">✔ PROCESO FINALIZADO</span>
+                      <span className="text-green-700 font-semibold">
+                        ✔ PROCESO FINALIZADO {bloqueada ? "(BLOQUEADO)" : ""}
+                      </span>
                     )}
                   </div>
                 </td>
@@ -442,24 +691,50 @@ export default function PolizasFinanciadas() {
                   <input
                     type="date"
                     value={p.fecha || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { fecha: e.target.value })}
-                    className="border rounded px-2 py-1"
+                    className={`border rounded px-2 py-1 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
+                </td>
+
+                <td className="text-center">
+                  {venc === "sin_fecha" && (
+                    <span className="px-2 py-1 rounded bg-gray-200 text-gray-700 text-xs">
+                      Sin fecha
+                    </span>
+                  )}
+                  {venc === "urgente" && (
+                    <span className="px-2 py-1 rounded bg-red-500 text-white text-xs">
+                      Urgente {dias !== null ? `(${dias}d)` : ""}
+                    </span>
+                  )}
+                  {venc === "proxima" && (
+                    <span className="px-2 py-1 rounded bg-yellow-400 text-black text-xs">
+                      Próxima {dias !== null ? `(${dias}d)` : ""}
+                    </span>
+                  )}
+                  {venc === "tranquila" && (
+                    <span className="px-2 py-1 rounded bg-green-500 text-white text-xs">
+                      Tranquila {dias !== null ? `(${dias}d)` : ""}
+                    </span>
+                  )}
                 </td>
 
                 <td>
                   <input
                     value={p.numeroPoliza || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { numeroPoliza: e.target.value })}
-                    className="border rounded px-2 py-1 w-28"
+                    className={`border rounded px-2 py-1 w-28 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
                 </td>
 
                 <td>
                   <select
                     value={p.aseguradora || "SURA"}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { aseguradora: e.target.value })}
-                    className="border rounded px-2 py-1"
+                    className={`border rounded px-2 py-1 ${bloqueada ? "bg-gray-100" : ""}`}
                   >
                     {aseguradorasLista.map((a) => (
                       <option key={a}>{a}</option>
@@ -470,26 +745,29 @@ export default function PolizasFinanciadas() {
                 <td>
                   <input
                     value={p.placa || ""}
+                    disabled={bloqueada}
                     onChange={(e) =>
                       guardarCampo(p.id, { placa: (e.target.value || "").toUpperCase() })
                     }
-                    className="border rounded px-2 py-1 w-24"
+                    className={`border rounded px-2 py-1 w-24 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
                 </td>
 
                 <td>
                   <input
                     value={p.nombre || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { nombre: e.target.value })}
-                    className="border rounded px-2 py-1 w-32"
+                    className={`border rounded px-2 py-1 w-32 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
                 </td>
 
                 <td>
                   <select
                     value={p.entidad || "Finesa"}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { entidad: e.target.value })}
-                    className="border rounded px-2 py-1"
+                    className={`border rounded px-2 py-1 ${bloqueada ? "bg-gray-100" : ""}`}
                   >
                     {entidadesLista.map((ent) => (
                       <option key={ent}>{ent}</option>
@@ -500,8 +778,9 @@ export default function PolizasFinanciadas() {
                 <td>
                   <select
                     value={Number(p.cuotas || 1)}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { cuotas: Number(e.target.value) })}
-                    className="border rounded px-2 py-1"
+                    className={`border rounded px-2 py-1 ${bloqueada ? "bg-gray-100" : ""}`}
                   >
                     {[...Array(12)].map((_, i) => (
                       <option key={i + 1}>{i + 1}</option>
@@ -512,8 +791,9 @@ export default function PolizasFinanciadas() {
                 <td>
                   <input
                     value={p.valor || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { valor: e.target.value })}
-                    className="border rounded px-2 py-1 w-28"
+                    className={`border rounded px-2 py-1 w-28 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
                 </td>
 
@@ -521,6 +801,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.montada}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { montada: e.target.checked })}
                   />
                 </td>
@@ -529,7 +810,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.recaudada}
-                    disabled={!p.montada}
+                    disabled={bloqueada || !p.montada}
                     onChange={(e) => guardarCampo(p.id, { recaudada: e.target.checked })}
                   />
                 </td>
@@ -538,7 +819,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.firmada}
-                    disabled={!p.recaudada}
+                    disabled={bloqueada || !p.recaudada}
                     onChange={(e) => guardarCampo(p.id, { firmada: e.target.checked })}
                   />
                 </td>
@@ -547,7 +828,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.desembolsada}
-                    disabled={!p.montada || !p.recaudada || !p.firmada}
+                    disabled={bloqueada || !p.montada || !p.recaudada || !p.firmada}
                     onChange={(e) => guardarCampo(p.id, { desembolsada: e.target.checked })}
                   />
                 </td>
@@ -555,8 +836,9 @@ export default function PolizasFinanciadas() {
                 <td className="text-center">
                   <select
                     value={p.endoso || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { endoso: e.target.value })}
-                    className="border rounded px-1"
+                    className={`border rounded px-1 ${bloqueada ? "bg-gray-100" : ""}`}
                   >
                     <option value="">-</option>
                     <option value="SI">SI</option>
@@ -565,22 +847,25 @@ export default function PolizasFinanciadas() {
                 </td>
 
                 <td className="text-center">
-                  {(p.endoso || "") === "SI" && (
+                  {p.endoso === "SI" && (
                     <input
                       type="checkbox"
                       checked={!!p.certificacion}
-                      disabled={!p.desembolsada}
+                      disabled={bloqueada || !p.desembolsada}
                       onChange={(e) => guardarCampo(p.id, { certificacion: e.target.checked })}
                     />
                   )}
                 </td>
 
                 <td className="text-center">
-                  {(p.endoso || "") === "SI" && !!p.certificacion && (
+                  {p.endoso === "SI" && p.certificacion && (
                     <select
                       value={p.correoEndoso ? "SI" : "NO"}
-                      onChange={(e) => guardarCampo(p.id, { correoEndoso: e.target.value === "SI" })}
-                      className="border rounded px-1"
+                      disabled={bloqueada}
+                      onChange={(e) =>
+                        guardarCampo(p.id, { correoEndoso: e.target.value === "SI" })
+                      }
+                      className={`border rounded px-1 ${bloqueada ? "bg-gray-100" : ""}`}
                     >
                       <option value="NO">NO</option>
                       <option value="SI">SI</option>
@@ -592,6 +877,7 @@ export default function PolizasFinanciadas() {
                   <input
                     type="checkbox"
                     checked={!!p.delegada}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { delegada: e.target.checked })}
                   />
                 </td>
@@ -599,24 +885,29 @@ export default function PolizasFinanciadas() {
                 <td>
                   <input
                     value={p.delegadaA || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { delegadaA: e.target.value })}
-                    className="border rounded px-2 py-1 w-32"
+                    className={`border rounded px-2 py-1 w-32 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
                 </td>
 
                 <td>
                   <input
                     value={p.gestor || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { gestor: e.target.value })}
-                    className="border rounded px-2 py-1 w-32"
+                    className={`border rounded px-2 py-1 w-32 ${bloqueada ? "bg-gray-100" : ""}`}
                   />
                 </td>
 
                 <td>
                   <textarea
                     value={p.gestionTexto || ""}
+                    disabled={bloqueada}
                     onChange={(e) => guardarCampo(p.id, { gestionTexto: e.target.value })}
-                    className="border rounded px-2 py-1 w-64 min-h-[44px]"
+                    className={`border rounded px-2 py-1 w-64 min-h-[44px] ${
+                      bloqueada ? "bg-gray-100" : ""
+                    }`}
                     placeholder="Escribe la gestión…"
                   />
                 </td>
@@ -624,8 +915,11 @@ export default function PolizasFinanciadas() {
                 <td>
                   <button
                     onClick={() => eliminarPoliza(p.id)}
-                    className="text-red-600 font-bold px-2"
-                    title="Eliminar"
+                    disabled={bloqueada}
+                    className={`font-bold px-2 ${
+                      bloqueada ? "text-gray-400 cursor-not-allowed" : "text-red-600"
+                    }`}
+                    title={bloqueada ? "Bloqueada: primero desbloquea" : "Eliminar"}
                   >
                     X
                   </button>
